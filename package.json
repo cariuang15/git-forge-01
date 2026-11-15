@@ -1,0 +1,16 @@
+{
+  "name": "gitforge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A standalone GitHub-compatible git forge: git smart HTTP, REST v3, GraphQL v4 and MCP in one Node process",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts",
+    "check": "node --experimental-strip-types --check app.ts",
+    "dev": "MAKEFUN_SHOP_TOKEN=test-token node --experimental-strip-types main.ts"
+  }
+}
