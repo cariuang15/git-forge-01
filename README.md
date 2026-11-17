@@ -1,5 +1,9 @@
 # gitforge — a standalone GitHub-compatible git forge
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/cariuang15/git-forge-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/cariuang15/git-forge-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 One Node process, no dependencies, no git binary, no network. It serves the four
 surfaces the make.fun `github-core-clone-01` suite drives, from its own in-memory
 store:
@@ -75,3 +79,7 @@ token is unset (local practice only), any non-empty bearer is accepted.
 Determinism: every timestamp the forge mints is fixed (2025-01-01), ids come
 from sequential counters, and no `Date.now`/`Math.random` touches stored state
 — two runs on the same instance leave byte-identical state.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=csc1bejp&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
