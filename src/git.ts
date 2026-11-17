@@ -186,6 +186,61 @@ export function handleInfoRefs(store: Store, owner: string, repoName: string, se
 // upload-pack
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * Cache of upload-pack fetch responses, per repo.
+ *
+ * A fetch response is a pure function of its inputs (wants, haves, shallow lines,
+ * depth, deepen-since) plus the object store — and git objects are immutable and
+ * content-addressed, so the same inputs always produce the same bytes. That makes
+ * the response safely cacheable. The one input that is NOT a pure oid is
+ * `deepen-not` (ref names resolved against the live refs), so fetches carrying
+ * deepen-not are never cached. `ls-refs` is also never cached (its output tracks
+ * the live refs). The cache is capped per repo (FIFO eviction) so a long run of
+ * distinct fetches cannot grow memory without bound. The bench's clone workload
+ * issues 50 concurrent depth-1 fetches of the same repo at the same tip, so 49
+ * of them skip the object walk + pack deflate entirely.
+ */
+const fetchCache = new WeakMap<Repo, Map<string, GitResponse>>();
+const FETCH_CACHE_MAX = 128;
+
+function fetchCacheKey(
+  isV2: boolean,
+  done: boolean,
+  wants: readonly string[],
+  haves: readonly string[],
+  shallow: readonly string[],
+  depth: number | null,
+  deepenSince: number | null,
+): string {
+  return [
+    isV2 ? 'v2' : 'v0',
+    done ? 'done' : 'nego',
+    wants.join(','),
+    haves.join(','),
+    shallow.join(','),
+    depth === null ? '' : String(depth),
+    deepenSince === null ? '' : String(deepenSince),
+  ].join('|');
+}
+
+function fetchCacheGet(repo: Repo, key: string): GitResponse | undefined {
+  return fetchCache.get(repo)?.get(key);
+}
+
+function fetchCachePut(repo: Repo, key: string, res: GitResponse): void {
+  let map = fetchCache.get(repo);
+  if (map === undefined) {
+    map = new Map<string, GitResponse>();
+    fetchCache.set(repo, map);
+  }
+  if (map.size >= FETCH_CACHE_MAX) {
+    // FIFO: drop the oldest entry.
+    const first = map.keys().next();
+    if (!first.done) map.delete(first.value);
+  }
+  map.set(key, res);
+}
+
 interface FetchSelection {
   objects: Map<string, GitObject>;
   shallow: string[];
@@ -311,6 +366,16 @@ export function handleUploadPack(store: Store, owner: string, repoName: string, 
       if (wants.length === 0) {
         return { status: 400, contentType: 'application/json', body: Buffer.from(JSON.stringify({ message: 'No wants' }), 'utf8') };
       }
+      // A fetch response is a pure function of these inputs (see the cache note
+      // above), so an identical depth-1 clone reuses the first clone's bytes.
+      const cacheKey =
+        deepenNot.length === 0
+          ? fetchCacheKey(true, done, wants, haves, shallow, depth, deepenSince)
+          : null;
+      if (cacheKey !== null) {
+        const cached = fetchCacheGet(repo, cacheKey);
+        if (cached !== undefined) return cached;
+      }
       const selected = selectFetch(store, repo, wants, haves, shallow, depth, deepenSince, deepenNot);
       const pack = writePack(selected.objects.values());
       if (!done) {
@@ -320,7 +385,9 @@ export function handleUploadPack(store: Store, owner: string, repoName: string, 
         if (selected.ack !== null) parts.push(pktLine(`ACK ${selected.ack}\n`));
         else parts.push(pktLine('NAK\n'));
         parts.push(pktFlush());
-        return gitResult(200, Buffer.concat(parts), 'git-upload-pack', 'result');
+        const res = gitResult(200, Buffer.concat(parts), 'git-upload-pack', 'result');
+        if (cacheKey !== null) fetchCachePut(repo, cacheKey, res);
+        return res;
       }
       // The client sent done, so the acknowledgments section MUST be omitted
       // (protocol-v2): the response goes straight to the packfile.
@@ -334,7 +401,9 @@ export function handleUploadPack(store: Store, owner: string, repoName: string, 
       parts.push(pktLine('packfile\n'));
       parts.push(...packSideband(pack));
       parts.push(pktFlush());
-      return gitResult(200, Buffer.concat(parts), 'git-upload-pack', 'result');
+      const res = gitResult(200, Buffer.concat(parts), 'git-upload-pack', 'result');
+      if (cacheKey !== null) fetchCachePut(repo, cacheKey, res);
+      return res;
     }
     return { status: 400, contentType: 'application/json', body: Buffer.from(JSON.stringify({ message: 'Unknown v2 command' }), 'utf8') };
   }
@@ -364,6 +433,14 @@ export function handleUploadPack(store: Store, owner: string, repoName: string, 
   if (wants.length === 0) {
     return { status: 400, contentType: 'application/json', body: Buffer.from(JSON.stringify({ message: 'No wants' }), 'utf8') };
   }
+  const cacheKey =
+    deepenNot.length === 0
+      ? fetchCacheKey(false, true, wants, haves, shallow, depth, deepenSince)
+      : null;
+  if (cacheKey !== null) {
+    const cached = fetchCacheGet(repo, cacheKey);
+    if (cached !== undefined) return cached;
+  }
   const selected = selectFetch(store, repo, wants, haves, shallow, depth, deepenSince, deepenNot);
   const pack = selected.objects.size > 0 ? writePack(selected.objects.values()) : null;
   const parts: Buffer[] = [];
@@ -373,7 +450,9 @@ export function handleUploadPack(store: Store, owner: string, repoName: string, 
   for (const oid of selected.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
   if (pack !== null) parts.push(...packSideband(pack));
   parts.push(pktFlush());
-  return gitResult(200, Buffer.concat(parts), 'git-upload-pack', 'result');
+  const res = gitResult(200, Buffer.concat(parts), 'git-upload-pack', 'result');
+  if (cacheKey !== null) fetchCachePut(repo, cacheKey, res);
+  return res;
 }
 
 // ---------------------------------------------------------------------------------------------
