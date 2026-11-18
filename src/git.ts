@@ -14,6 +14,84 @@ export interface Packet {
   payload: Buffer;
 }
 
+/**
+ * A pkt-line writer that fills one preallocated buffer (growing it when needed) instead
+ * of building a Buffer per line and concatenating them. The hot responses (advertisements,
+ * fetch packfiles, push reports) are dozens of small pkt-lines; the per-line Buffer.from
+ * + Buffer.concat in pktLine/sideband was a measurable share of their cost.
+ */
+export class PktWriter {
+  private buf: Buffer;
+  private off = 0;
+  constructor(capacity = 1024) {
+    this.buf = Buffer.allocUnsafe(capacity);
+  }
+  private grow(need: number): void {
+    if (this.off + need <= this.buf.length) return;
+    const next = Buffer.allocUnsafe(Math.max(this.buf.length * 2, this.off + need));
+    this.buf.copy(next, 0, 0, this.off);
+    this.buf = next;
+  }
+  raw(b: Buffer): void {
+    this.grow(b.length);
+    b.copy(this.buf, this.off);
+    this.off += b.length;
+  }
+  text(s: string): void {
+    this.raw(Buffer.from(s, 'utf8'));
+  }
+  pktLine(payload: Buffer): void {
+    const len = payload.length + 4;
+    this.grow(len);
+    this.buf.write(len.toString(16).padStart(4, '0'), this.off, 'ascii');
+    payload.copy(this.buf, this.off + 4);
+    this.off += len;
+  }
+  pktLineText(s: string): void {
+    this.pktLine(Buffer.from(s, 'utf8'));
+  }
+  flush(): void {
+    this.grow(4);
+    this.buf.write('0000', this.off, 'ascii');
+    this.off += 4;
+  }
+  delim(): void {
+    this.grow(4);
+    this.buf.write('0001', this.off, 'ascii');
+    this.off += 4;
+  }
+  /** One sideband packet: a pkt-line whose payload is [band] + data. */
+  sideband(band: number, data: Buffer): void {
+    const len = data.length + 1 + 4;
+    this.grow(len);
+    this.buf.write(len.toString(16).padStart(4, '0'), this.off, 'ascii');
+    this.buf[this.off + 4] = band;
+    data.copy(this.buf, this.off + 5);
+    this.off += len;
+  }
+  /**
+   * A sideband packet whose band payload is itself a pkt-line (the report-status
+   * framing: the client decodes the band-1 bytes as pkt-lines, so a bare text
+   * line there would be read as a raw line and the inner flush "0000" would
+   * surface as a bogus report line).
+   */
+  sidebandPktLine(band: number, text: string): void {
+    const textLen = Buffer.byteLength(text, 'utf8');
+    const innerLen = textLen + 4;
+    const len = innerLen + 1 + 4;
+    this.grow(len);
+    this.buf.write(len.toString(16).padStart(4, '0'), this.off, 'ascii');
+    this.buf[this.off + 4] = band;
+    this.buf.write(innerLen.toString(16).padStart(4, '0'), this.off + 5, 'ascii');
+    this.buf.write(text, this.off + 9, 'utf8');
+    this.off += len;
+  }
+  /** The bytes written so far (a view; the backing buffer is not reused after this). */
+  build(): Buffer {
+    return this.buf.subarray(0, this.off);
+  }
+}
+
 export function pktLine(data: Buffer | string): Buffer {
   const body = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
   const len = body.length + 4;
@@ -137,47 +215,50 @@ export function handleInfoRefs(store: Store, owner: string, repoName: string, se
   const refs = listRefs(store, repo);
   if (service === 'git-upload-pack') {
     if (isV2) {
-      const parts: Buffer[] = [
-        pktLine('# service=git-upload-pack\n'),
-        pktFlush(),
-        pktLine('version 2\n'),
-      ];
-      for (const cap of UPLOAD_V2_CAPS) parts.push(pktLine(`${cap}\n`));
-      parts.push(pktFlush());
-      return gitResult(200, Buffer.concat(parts), 'git-upload-pack', 'advertisement');
+      const w = new PktWriter(256);
+      w.pktLineText('# service=git-upload-pack\n');
+      w.flush();
+      w.pktLineText('version 2\n');
+      for (const cap of UPLOAD_V2_CAPS) w.pktLineText(`${cap}\n`);
+      w.flush();
+      return gitResult(200, w.build(), 'git-upload-pack', 'advertisement');
     }
-    const parts: Buffer[] = [pktLine('# service=git-upload-pack\n'), pktFlush()];
+    const w = new PktWriter(512);
+    w.pktLineText('# service=git-upload-pack\n');
+    w.flush();
     if (refs.length === 1 && refs[0]!.name === 'HEAD' && refs[0]!.oid === ZERO_OID) {
-      parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${UPLOAD_V0_CAPS}\n`));
+      w.pktLineText(`${ZERO_OID} capabilities^{}\0${UPLOAD_V0_CAPS}\n`);
     } else {
       refs.forEach((ref, index) => {
         if (index === 0) {
-          parts.push(pktLine(`${ref.oid} ${ref.name}\0${UPLOAD_V0_CAPS}\n`));
+          w.pktLineText(`${ref.oid} ${ref.name}\0${UPLOAD_V0_CAPS}\n`);
         } else {
-          parts.push(pktLine(`${ref.oid} ${ref.name}\n`));
+          w.pktLineText(`${ref.oid} ${ref.name}\n`);
         }
-        if (ref.peeled !== undefined) parts.push(pktLine(`${ref.peeled} ${ref.name}^{}\n`));
+        if (ref.peeled !== undefined) w.pktLineText(`${ref.peeled} ${ref.name}^{}\n`);
       });
     }
-    parts.push(pktFlush());
-    return gitResult(200, Buffer.concat(parts), 'git-upload-pack', 'advertisement');
+    w.flush();
+    return gitResult(200, w.build(), 'git-upload-pack', 'advertisement');
   }
   if (service === 'git-receive-pack') {
-    const parts: Buffer[] = [pktLine('# service=git-receive-pack\n'), pktFlush()];
+    const w = new PktWriter(512);
+    w.pktLineText('# service=git-receive-pack\n');
+    w.flush();
     if (refs.length === 1 && refs[0]!.name === 'HEAD' && refs[0]!.oid === ZERO_OID) {
-      parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${RECEIVE_V0_CAPS}\n`));
+      w.pktLineText(`${ZERO_OID} capabilities^{}\0${RECEIVE_V0_CAPS}\n`);
     } else {
       refs.forEach((ref, index) => {
         if (index === 0) {
-          parts.push(pktLine(`${ref.oid} ${ref.name}\0${RECEIVE_V0_CAPS}\n`));
+          w.pktLineText(`${ref.oid} ${ref.name}\0${RECEIVE_V0_CAPS}\n`);
         } else {
-          parts.push(pktLine(`${ref.oid} ${ref.name}\n`));
+          w.pktLineText(`${ref.oid} ${ref.name}\n`);
         }
-        if (ref.peeled !== undefined) parts.push(pktLine(`${ref.peeled} ${ref.name}^{}\n`));
+        if (ref.peeled !== undefined) w.pktLineText(`${ref.peeled} ${ref.name}^{}\n`);
       });
     }
-    parts.push(pktFlush());
-    return gitResult(200, Buffer.concat(parts), 'git-receive-pack', 'advertisement');
+    w.flush();
+    return gitResult(200, w.build(), 'git-receive-pack', 'advertisement');
   }
   return { status: 400, contentType: 'application/json', body: Buffer.from(JSON.stringify({ message: 'Unknown service' }), 'utf8') };
 }
@@ -280,13 +361,12 @@ function selectFetch(store: Store, repo: Repo, wants: string[], haves: string[],
   return { objects: collected.objects, shallow: collected.shallow, unshallow: collected.unshallow, ack };
 }
 
-function packSideband(pack: Buffer): Buffer[] {
-  const parts: Buffer[] = [];
+/** Write a packfile as sideband-1 pkt-lines into `w` (chunked at the pkt-line max). */
+function packSideband(w: PktWriter, pack: Buffer): void {
   const CHUNK = 65515; // pkt-line max 65520 minus 4 length bytes minus 1 band byte
   for (let i = 0; i < pack.length; i += CHUNK) {
-    parts.push(sideband(1, pack.subarray(i, Math.min(pack.length, i + CHUNK))));
+    w.sideband(1, pack.subarray(i, Math.min(pack.length, i + CHUNK)));
   }
-  return parts;
 }
 
 export function handleUploadPack(store: Store, owner: string, repoName: string, body: Buffer, isV2: boolean): GitResponse {
@@ -381,27 +461,28 @@ export function handleUploadPack(store: Store, owner: string, repoName: string, 
       if (!done) {
         // A negotiation round: the acknowledgments section alone, then flush. No
         // packfile yet; the client will answer with more haves or done.
-        const parts: Buffer[] = [pktLine('acknowledgments\n')];
-        if (selected.ack !== null) parts.push(pktLine(`ACK ${selected.ack}\n`));
-        else parts.push(pktLine('NAK\n'));
-        parts.push(pktFlush());
-        const res = gitResult(200, Buffer.concat(parts), 'git-upload-pack', 'result');
+        const w = new PktWriter(128);
+        w.pktLineText('acknowledgments\n');
+        if (selected.ack !== null) w.pktLineText(`ACK ${selected.ack}\n`);
+        else w.pktLineText('NAK\n');
+        w.flush();
+        const res = gitResult(200, w.build(), 'git-upload-pack', 'result');
         if (cacheKey !== null) fetchCachePut(repo, cacheKey, res);
         return res;
       }
       // The client sent done, so the acknowledgments section MUST be omitted
       // (protocol-v2): the response goes straight to the packfile.
-      const parts: Buffer[] = [];
+      const w = new PktWriter(pack.length + 256);
       if (selected.shallow.length > 0 || selected.unshallow.length > 0) {
-        parts.push(pktLine('shallow-info\n'));
-        for (const oid of selected.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-        for (const oid of selected.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-        parts.push(pktDelim());
+        w.pktLineText('shallow-info\n');
+        for (const oid of selected.shallow) w.pktLineText(`shallow ${oid}\n`);
+        for (const oid of selected.unshallow) w.pktLineText(`unshallow ${oid}\n`);
+        w.delim();
       }
-      parts.push(pktLine('packfile\n'));
-      parts.push(...packSideband(pack));
-      parts.push(pktFlush());
-      const res = gitResult(200, Buffer.concat(parts), 'git-upload-pack', 'result');
+      w.pktLineText('packfile\n');
+      packSideband(w, pack);
+      w.flush();
+      const res = gitResult(200, w.build(), 'git-upload-pack', 'result');
       if (cacheKey !== null) fetchCachePut(repo, cacheKey, res);
       return res;
     }
@@ -443,14 +524,14 @@ export function handleUploadPack(store: Store, owner: string, repoName: string, 
   }
   const selected = selectFetch(store, repo, wants, haves, shallow, depth, deepenSince, deepenNot);
   const pack = selected.objects.size > 0 ? writePack(selected.objects.values()) : null;
-  const parts: Buffer[] = [];
-  if (selected.ack !== null) parts.push(pktLine(`ACK ${selected.ack}\n`));
-  else parts.push(pktLine('NAK\n'));
-  for (const oid of selected.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-  for (const oid of selected.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-  if (pack !== null) parts.push(...packSideband(pack));
-  parts.push(pktFlush());
-  const res = gitResult(200, Buffer.concat(parts), 'git-upload-pack', 'result');
+  const w = new PktWriter((pack?.length ?? 0) + 256);
+  if (selected.ack !== null) w.pktLineText(`ACK ${selected.ack}\n`);
+  else w.pktLineText('NAK\n');
+  for (const oid of selected.shallow) w.pktLineText(`shallow ${oid}\n`);
+  for (const oid of selected.unshallow) w.pktLineText(`unshallow ${oid}\n`);
+  if (pack !== null) packSideband(w, pack);
+  w.flush();
+  const res = gitResult(200, w.build(), 'git-upload-pack', 'result');
   if (cacheKey !== null) fetchCachePut(repo, cacheKey, res);
   return res;
 }
@@ -527,7 +608,6 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
   packOffset = offset;
   const packBytes = body.subarray(packOffset);
 
-  const reportLines: string[] = [];
   let unpackOk = true;
   let unpackError = '';
   const hasUpdates = commands.some((c) => c.newOid !== ZERO_OID);
@@ -598,22 +678,23 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
     reports.push({ ref: command.ref, ok: true, reason: '' });
   }
 
-  reportLines.push(unpackOk ? 'unpack ok\n' : `unpack ${unpackError === '' ? 'error' : unpackError}\n`);
+  const w = new PktWriter(256);
+  const reportLine = (line: string): void => {
+    // Inside band 1 the report lines are themselves pkt-lines (see sidebandPktLine).
+    if (useSideband) w.sidebandPktLine(1, line);
+    else w.pktLineText(line);
+  };
+  reportLine(unpackOk ? 'unpack ok\n' : `unpack ${unpackError === '' ? 'error' : unpackError}\n`);
   for (const report of reports) {
-    reportLines.push(report.ok ? `ok ${report.ref}\n` : `ng ${report.ref} ${report.reason}\n`);
-  }
-  const parts: Buffer[] = [];
-  for (const line of reportLines) {
-    if (useSideband) parts.push(sideband(1, pktLine(line)));
-    else parts.push(pktLine(line));
+    reportLine(report.ok ? `ok ${report.ref}\n` : `ng ${report.ref} ${report.reason}\n`);
   }
   if (useSideband) {
     // The report stream itself ends with a flush inside band 1 (git's
     // generate_report ends with packet_buf_flush); the outer flush below then
     // ends the sideband stream. Without the inner flush the client's report
     // reader hits EOF and dies "the remote end hung up unexpectedly".
-    parts.push(sideband(1, pktFlush()));
+    w.sideband(1, Buffer.from('0000', 'ascii'));
   }
-  parts.push(pktFlush());
-  return gitResult(200, Buffer.concat(parts), 'git-receive-pack', 'result');
+  w.flush();
+  return gitResult(200, w.build(), 'git-receive-pack', 'result');
 }

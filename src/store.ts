@@ -187,10 +187,13 @@ function adler32(data: Buffer): number {
 /**
  * Inflate the first zlib stream starting at `start` in `buf`. inflateSync stops at the
  * stream's end and ignores trailing bytes, so one call yields the data; the stream ends
- * with the Adler-32 of that data, which locates the boundary (verified by a second
- * inflate of exactly [start, end)). This replaces a binary search that re-inflated
- * (and threw, building a stack trace) on every probe — about 8 inflateSync calls per
- * object, ~390 us, versus ~35 us here.
+ * with the Adler-32 of that data, which locates the boundary. The boundary is trusted
+ * because a wrong one cannot survive the pack parse: the next object's header would be
+ * garbage (or the final offset would not land on the trailer), and readPack throws.
+ * (An earlier version re-inflated the exact [start, end) slice to verify the boundary;
+ * that second inflateSync per object cost ~30 us per pack for no extra safety, since a
+ * false-positive Adler inside the deflate data is ~1e-7 per object and any surviving
+ * error is caught by the final-offset check in readPack.)
  */
 function inflatePrefix(buf: Buffer, start: number, size: number): { data: Buffer; next: number } | null {
   let data: Buffer;
@@ -205,13 +208,7 @@ function inflatePrefix(buf: Buffer, start: number, size: number): { data: Buffer
   for (let p = start + 2; p + 4 <= buf.length; p += 1) {
     if (buf[p] !== first) continue;
     if (buf.readUInt32BE(p) !== adler) continue;
-    const end = p + 4;
-    try {
-      const check = inflateSync(buf.subarray(start, end));
-      if (check.length === size) return { data: check, next: end };
-    } catch {
-      // Not the boundary (the Adler bytes inside the deflate data): keep scanning.
-    }
+    return { data, next: p + 4 };
   }
   return null;
 }
@@ -336,6 +333,10 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
     objects.set(oid, obj);
     byOffset.set(entryOffset, obj);
   }
+  // A wrong stream boundary (a false-positive Adler inside deflate data) shifts every
+  // later object, so the parse cannot end exactly on the trailer: that is the check
+  // that makes the single-inflate boundary above safe.
+  if (offset !== pack.length - 20) throw new Error('pack parse did not consume the pack');
   return { objects };
 }
 
