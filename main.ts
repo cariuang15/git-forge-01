@@ -31,11 +31,12 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 2_000;
 
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
 
 /** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
 function retryDelay(attempt: number): number {
-  return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
+  const step = Math.min(attempt, 8);
+  return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** step);
 }
 
 /**
@@ -46,10 +47,11 @@ function retryDelay(attempt: number): number {
 async function register(port: number): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
+      const payload = JSON.stringify({ port });
       const res = await fetch(`${ENV_URL}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ port }),
+        body: payload,
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
       if (res.status === 200 || res.status === 409) return;
